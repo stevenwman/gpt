@@ -2,4 +2,4 @@ runs/
 videos/
 *.pt
 *.mp4
-*/__pycache__/
+**/__pycache__/
