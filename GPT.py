@@ -22,20 +22,29 @@ class GPTConfig:
     # Transformer params
     block_size: int         = 256   # sequence length
     n_embed: int            = 64
-    n_head: int             = 8
-    n_layer: int            = 6
+    n_heads: int             = 8
+    n_layers: int            = 6
+    state_dim: int          = 7
+    action_dim: int         = 6
     # Regularizer params
     dropout: float          = 0.2
-    elem_aff: bool          = False
-    ln_eps: float           = 1e-6
-    ln_bias: bool           = True
+    elem_aff: bool          = False # only for AdaLN
+    ln_eps: float           = 1e-6  # only for AadLN
+    ln_bias: bool           = True  # only for AdaLN
     # Feedforward params
     ff_dim: int             = 4 * n_embed
     kqv_mlp: bool           = False
     ff_bias: bool           = True
     slow_attention: bool    = False
     masked: bool            = True
-    
+
+
+def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+    """
+    Shift scale operations for AdaLN
+    """
+    return x * (1 + scale) + shift
+
 
 class FeedForward(nn.Module):
     def __init__(self, cfg: GPTConfig, activation='ReLU'):
@@ -56,10 +65,10 @@ class FeedForward(nn.Module):
 class CausalMHA(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()  
-        assert cfg.n_embed % cfg.n_head == 0, "Embedding dimension must be divisible by number of heads"
+        assert cfg.n_embed % cfg.n_heads == 0, "Embedding dimension must be divisible by number of heads"
         self.cfg = cfg
         self.n_embed    = cfg.n_embed
-        self.n_head     = cfg.n_head
+        self.n_heads     = cfg.n_heads
         self.dropout    = cfg.dropout
         self.masked     = cfg.masked
 
@@ -101,7 +110,7 @@ class CausalMHA(nn.Module):
 
     def split_heads(self, x:Tensor) -> Tensor:
         B, T, C = x.size()
-        return x.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        return x.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
     
     def combine_heads(self, x: Tensor) -> Tensor:
         B, nh, T, hs = x.size()
@@ -115,7 +124,6 @@ class CausalMHA(nn.Module):
             q, k, v = self.w_q(q), self.w_k(k), self.w_v(v)
 
         q, k, v = self.split_heads(q), self.split_heads(k), self.split_heads(v)
-
         attn = self.scaled_dot_product_attn(q, k, v)
         y = self.out_proj(self.combine_heads(attn))
         y = self.resid_dropout(y)
@@ -135,17 +143,13 @@ class AdaLNBlock(nn.Module):
             nn.SiLU(), 
             nn.Linear(cfg.n_embed, 6 * cfg.n_embed), bias=cfg.ff_bias
             )
-    
-    @staticmethod
-    def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
-        return x * (1 + scale) + shift
 
     def forward(self, x: Tensor) -> Tensor:
         shift_msa, scale_msa, gate_msa, shift_ffwd, scale_ffwd, gate_ffwd = \
             self.adaLN_modulation(x).chunk(6, dim=-1)
-        moduln = self.modulate(self.ln_1(x), shift_msa, scale_msa)
+        moduln = modulate(self.ln_1(x), shift_msa, scale_msa)
         x = x + self.attn(moduln, moduln, moduln) * gate_msa.unsqueeze(-1)
-        x = x + self.ffwd(self.modulate(self.ln_2(x), shift_ffwd, scale_ffwd)) * gate_ffwd.unsqueeze(-1)
+        x = x + self.ffwd(modulate(self.ln_2(x), shift_ffwd, scale_ffwd)) * gate_ffwd.unsqueeze(-1)
         return x
     
 
@@ -156,12 +160,9 @@ class GPTBlock(nn.Module):
         self.cross_attn = CausalMHA(cfg)
         self.ffwd = FeedForward(cfg)
         self.dropout = nn.Dropout(cfg.dropout)
-        self.ln_1 = nn.LayerNorm(cfg.n_embed, bias=cfg.ln_bias, 
-                                 elementwise_affine=cfg.elem_aff, eps=cfg.ln_eps)
-        self.ln_2 = nn.LayerNorm(cfg.n_embed, bias=cfg.ln_bias, 
-                                 elementwise_affine=cfg.elem_aff, eps=cfg.ln_eps)
-        self.ln_3 = nn.LayerNorm(cfg.n_embed, bias=cfg.ln_bias, 
-                                 elementwise_affine=cfg.elem_aff, eps=cfg.ln_eps)
+        self.ln_1 = nn.LayerNorm(cfg.n_embed)
+        self.ln_2 = nn.LayerNorm(cfg.n_embed)
+        self.ln_3 = nn.LayerNorm(cfg.n_embed)
         
     def forward(self, x: Tensor, context: Tensor = None) -> Tensor:
         x = self.ln_1(x)
@@ -171,3 +172,51 @@ class GPTBlock(nn.Module):
         x = self.ln_3(x + self.dropout(attn))
         x = x + self.dropout(self.ffwd(x))
         return x
+    
+
+class FinalLayer(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(cfg.n_embed, elementwise_affine=cfg.elem_aff, eps=cfg.ln_eps)
+        self.linear = nn.Linear(cfg.n_embed, bias=cfg.ff_bias)
+        self.adaLN_modulation: Callable[[Tensor], Tensor] = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cfg.n_embed, 2 * cfg.n_embed, bias=cfg.ff_bias)
+        )
+
+    def forward(self, inp, cond):
+        shift, scale = self.adaLN_modulation(cond).chunk(2, dim=2)
+        inp = modulate(self.norm_final(inp), shift, scale)
+        out = self.linear(inp)
+        return out
+    
+
+class GPT_XAttn(nn.Module):
+    def __init__(self, cfg: GPTConfig, pos_embedding: Callable[[Tensor],Tensor], is_critic: bool):
+        self.encode_state = nn.Linear(cfg.state_dim, cfg.n_embed)
+        self.embed_action = nn.Linear(cfg.action_dim, cfg.n_embed)
+        self.pos_embedding = pos_embedding
+        self.dropout = nn.Dropout(cfg.dropout)
+        self.decoder_layers = nn.ModuleList([GPTBlock(cfg) for _ in range(cfg.n_layers)])
+
+        out_dim = 1 if is_critic else cfg.action_dim
+        self.actor_mu_layer = nn.Linear(cfg.n_embed, out_dim)
+        self.activation = nn.GELU()
+
+    def forward(self, state, actions, pos):
+        state_enc = self.encode_state(state)
+        pos_embed = self.pos_embedding(pos)
+        cond_enc = pos_embed.squeeze(2) + state_enc
+        act_enc = self.activation(self.embed_action(actions))
+        for layer in self.decoder_layers:
+            act_enc = layer(act_enc, cond_enc)
+        act_mean = self.actor_mu_layer(act_enc)
+        return act_mean
+    
+
+class GPT_AdaLN(nn.Module):
+    def __init__(self, cfg: GPTConfig, pos_embedding: Callable[[Tensor],Tensor], is_critic: bool):
+        super().__init__()
+        self.encode_state = nn.Linear(cfg.state_dim, cfg.n_embed)
+        self.embed_action = nn.Linear(cfg.action_dim, cfg.n_embed)
+        
