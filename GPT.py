@@ -10,7 +10,7 @@ torch.manual_seed(69420)
 
 
 @dataclass
-class GPTConfig:
+class Config:
     # Learning params
     batch_size: int         = 64
     max_iters: int          = 5000
@@ -47,7 +47,7 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 
 
 class FeedForward(nn.Module):
-    def __init__(self, cfg: GPTConfig, activation='ReLU'):
+    def __init__(self, cfg: Config, activation='ReLU'):
         super().__init__()
         self.activ_fn   = getattr(nn,activation)
         self.lin_1      = nn.Linear(cfg.n_embed, cfg.ff_dim)
@@ -63,7 +63,7 @@ class FeedForward(nn.Module):
     
 
 class CausalMHA(nn.Module):
-    def __init__(self, cfg: GPTConfig):
+    def __init__(self, cfg: Config):
         super().__init__()  
         assert cfg.n_embed % cfg.n_heads == 0, "Embedding dimension must be divisible by number of heads"
         self.cfg = cfg
@@ -131,7 +131,7 @@ class CausalMHA(nn.Module):
     
 
 class AdaLNBlock(nn.Module):
-    def __init__(self, cfg: GPTConfig):
+    def __init__(self, cfg: Config):
         super().__init__()
         self.attn = CausalMHA(cfg)
         self.ffwd = FeedForward(cfg)
@@ -154,7 +154,7 @@ class AdaLNBlock(nn.Module):
     
 
 class GPTBlock(nn.Module):
-    def __init__(self, cfg: GPTConfig):
+    def __init__(self, cfg: Config):
         super().__init__()
         self.self_attn = CausalMHA(cfg)
         self.cross_attn = CausalMHA(cfg)
@@ -174,11 +174,11 @@ class GPTBlock(nn.Module):
         return x
     
 
-class FinalLayer(nn.Module):
-    def __init__(self, cfg: GPTConfig):
+class AdaLNFinalLayer(nn.Module):
+    def __init__(self, cfg: Config, out_dim):
         super().__init__()
         self.norm_final = nn.LayerNorm(cfg.n_embed, elementwise_affine=cfg.elem_aff, eps=cfg.ln_eps)
-        self.linear = nn.Linear(cfg.n_embed, bias=cfg.ff_bias)
+        self.linear = nn.Linear(cfg.n_embed, out_dim, bias=cfg.ff_bias)
         self.adaLN_modulation: Callable[[Tensor], Tensor] = nn.Sequential(
             nn.SiLU(),
             nn.Linear(cfg.n_embed, 2 * cfg.n_embed, bias=cfg.ff_bias)
@@ -192,7 +192,7 @@ class FinalLayer(nn.Module):
     
 
 class GPT_XAttn(nn.Module):
-    def __init__(self, cfg: GPTConfig, pos_embedding: Callable[[Tensor],Tensor], is_critic: bool):
+    def __init__(self, cfg: Config, pos_embedding: Callable[[Tensor],Tensor], is_critic: bool):
         self.encode_state = nn.Linear(cfg.state_dim, cfg.n_embed)
         self.embed_action = nn.Linear(cfg.action_dim, cfg.n_embed)
         self.pos_embedding = pos_embedding
@@ -215,8 +215,63 @@ class GPT_XAttn(nn.Module):
     
 
 class GPT_AdaLN(nn.Module):
-    def __init__(self, cfg: GPTConfig, pos_embedding: Callable[[Tensor],Tensor], is_critic: bool):
+    def __init__(self, cfg: Config, pos_embedding: Callable[[Tensor],Tensor], is_critic: bool):
         super().__init__()
         self.encode_state = nn.Linear(cfg.state_dim, cfg.n_embed)
         self.embed_action = nn.Linear(cfg.action_dim, cfg.n_embed)
-        
+        self.pos_embedding = pos_embedding
+        self.dropout = nn.Dropout(cfg.dropout)
+
+        self.decoder_layers = nn.ModuleList([AdaLNBlock(cfg) for _ in range(cfg.n_layers)])
+        out_dim = 1 if is_critic else cfg.action_dim
+        self.final_layer = AdaLNFinalLayer(cfg, out_dim)
+        self.activation = nn.GELU
+
+    def forward(self, state, actions, pos):
+        state_enc = self.encode_state(state)
+        pos_embed = self.pos_embedding(pos)
+        cond_enc = pos_embed.squeeze(2) + state_enc
+        act_enc = self.activation(self.embed_action(actions))
+        for layer in self.decoder_layers:
+            act_enc = layer(act_enc, cond_enc)
+        act_mean = self.final_layer(act_enc, cond_enc)
+        return act_mean
+    
+
+class IntegerEmbeddingModel(nn.Module):
+    def __init__(self, num_embeddings, n_embed):
+        super().__init__()
+        self.embedding = nn.Embedding(num_embeddings, n_embed)
+        self.linear1 = nn.Linear(n_embed, n_embed)
+        self.linear2 = nn.Linear(n_embed, n_embed)
+    
+    def forward(self, x):
+        x = self.embedding(x)
+        x = F.relu(self.linear1(x))
+        x = F.relu(self.linear2(x))
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(self, cfg: Config, act_limit, use_adaln: bool):
+        self.cfg = cfg
+        self.device = cfg.device
+        self.act_limit = act_limit
+        self.act_dim = cfg.action_dim
+        self.pos_embedding = IntegerEmbeddingModel(self.act_dim, cfg.n_embed)
+        log_std = -0.5 * torch.ones(self.act_dim)
+        self.log_std = nn.Parameter(log_std)
+
+        GPTArch = GPT_AdaLN if use_adaln else GPT_XAttn
+        self.decoder_actor = GPTArch(cfg, self.pos_embedding, is_critic=False)
+        self.decoder_critic1 = GPTArch(cfg, self.pos_embedding, is_critic=True)
+        self.decoder_critic2 = GPTArch(cfg, self.pos_embedding, is_critic=True)
+
+    # TODO: figure out how you want to init weights
+    # might just go with outside function
+    def _init_weights(self):
+        def _basic_init(module, activation="relu"):
+            nn.init.orthogonal_(module, gain=nn.init.calculate_gain(activation))
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
