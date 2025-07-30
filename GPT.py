@@ -196,13 +196,16 @@ class AdaLNFinalLayer(nn.Module):
 class GPT_XAttn(nn.Module):
     def __init__(self, cfg: Config, is_critic: bool):
         super().__init__()
-        self.encode_state = nn.Linear(cfg.state_dim, cfg.n_embed)
-        self.embed_action = nn.Linear(cfg.action_dim, cfg.n_embed)
         self.cfg = cfg
-
+        self.encode_state: Callable[[Tensor], Tensor] = nn.Linear(cfg.state_dim, cfg.n_embed)
+        self.embed_action: Callable[[Tensor], Tensor] = nn.Linear(cfg.action_dim, cfg.n_embed)
+        # full bullshit moment
+        self.state_compressor: Callable[[Tensor], Tensor] = nn.Linear(cfg.state_dim, cfg.action_dim)
+        
         if cfg.pos_embed:
             self.act_pos_embedding = IntegerEmbeddingModel(cfg.action_dim, cfg.n_embed)
             self.cond_pos_embedding = IntegerEmbeddingModel(cfg.state_dim, cfg.n_embed)
+            
         self.dropout = nn.Dropout(cfg.dropout)
         self.decoder_layers = nn.ModuleList([GPTBlock(cfg) for _ in range(cfg.n_layers)])
 
@@ -210,18 +213,19 @@ class GPT_XAttn(nn.Module):
         self.actor_mu_layer = nn.Linear(cfg.n_embed, out_dim)
         self.activation = nn.GELU()
 
-    def forward(self, state, actions):
-        state_enc = self.encode_state(state)
-        act_enc = self.embed_action(actions)
+    def forward(self, state: Tensor, actions: Tensor) -> Tensor:
+        state_enc = self.encode_state(state.transpose(-1, -2)).squeeze(-1)  # (B, n_embed)
+        act_enc = self.embed_action(actions.transpose(-1, -2)).squeeze(-1)  # (B, n_embed)
 
         if self.cfg.pos_embed:
             act_pos_embed = self.act_pos_embedding(actions)
             state_pos_embed = self.cond_pos_embedding(state)
-            cond_enc = state_pos_embed + state_enc
+            state_enc: Tensor = state_pos_embed + state_enc
             act_enc = act_pos_embed + self.activation(act_enc)
 
+        state_enc = self.state_compressor(state_enc.transpose(-1,-2)).transpose(-1, -2)  # (B, n_embed, 1)
         for layer in self.decoder_layers:
-            act_enc = layer(act_enc, cond_enc)
+            act_enc = layer(act_enc, state_enc)
         act_mean = self.actor_mu_layer(act_enc)
         return act_mean
     
@@ -233,7 +237,7 @@ class GPT_AdaLN(nn.Module):
 
         self.encode_state: Callable[[Tensor], Tensor] = nn.Linear(cfg.state_dim, cfg.n_embed)
         self.embed_action: Callable[[Tensor], Tensor] = nn.Linear(cfg.action_dim, cfg.n_embed)
-        # fullshit moment
+        # full bullshit moment
         self.state_compressor: Callable[[Tensor], Tensor] = nn.Linear(cfg.state_dim, cfg.action_dim)
 
         if cfg.pos_embed:
@@ -254,13 +258,13 @@ class GPT_AdaLN(nn.Module):
         if self.cfg.pos_embed:
             act_pos_embed = self.act_pos_embedding(actions)
             state_pos_embed = self.cond_pos_embedding(state)
-            cond_enc: Tensor = state_pos_embed + state_enc
-            cond_enc = self.state_compressor(cond_enc.transpose(-1,-2)).transpose(-1, -2)  # (B, n_embed, 1)
+            state_enc: Tensor = state_pos_embed + state_enc
             act_enc = act_pos_embed + self.activation(act_enc)
 
+        state_enc = self.state_compressor(state_enc.transpose(-1,-2)).transpose(-1, -2)  # (B, n_embed, 1)
         for layer in self.decoder_layers:
-            act_enc = layer(act_enc, cond_enc)
-        act_mean = self.final_layer(act_enc, cond_enc)
+            act_enc = layer(act_enc, state_enc)
+        act_mean = self.final_layer(act_enc, state_enc)
         return act_mean
     
 
