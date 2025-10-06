@@ -450,8 +450,8 @@ if __name__ == "__main__":
                 if logger is not None:
                     logger.add_scalar(f"eval/{k}", mean, global_step)
             pbar.set_description(
-                f"success_once: {eval_metrics_mean['success_once']:.2f}, "
-                f"return: {eval_metrics_mean['return']:.2f}"
+                # f"success_once: {eval_metrics_mean['success_once']:.2f}, "
+                # f"return: {eval_metrics_mean['return']:.2f}"
             )
             if logger is not None:
                 eval_time = time.perf_counter() - stime
